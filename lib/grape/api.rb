@@ -282,6 +282,7 @@ module Grape
       def get(paths = ['/'], options = {}, &block); route('GET', paths, options, &block) end
       def post(paths = ['/'], options = {}, &block); route('POST', paths, options, &block) end
       def put(paths = ['/'], options = {}, &block); route('PUT', paths, options, &block) end
+      def patch(paths = ['/'], options = {}, &block); route('PATCH', paths, options, &block) end
       def head(paths = ['/'], options = {}, &block); route('HEAD', paths, options, &block) end
       def delete(paths = ['/'], options = {}, &block); route('DELETE', paths, options, &block) end
       def options(paths = ['/'], options = {}, &block); route('OPTIONS', paths, options, &block) end
