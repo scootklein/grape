@@ -11,8 +11,14 @@ tmtags
 \#*
 .\#*
 
+## REDCAR
+.redcar
+
 ## VIM
 *.swp
+
+## RUBYMINE
+.idea
 
 ## PROJECT::GENERAL
 coverage
@@ -23,7 +29,8 @@ pkg
 .yardoc/*
 dist
 Gemfile.lock
-*.orig
-*.rej
+
+## Rubinius
+.rbx
 
 ## PROJECT::SPECIFIC

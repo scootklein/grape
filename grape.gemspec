@@ -10,6 +10,7 @@ Gem::Specification.new do |s|
   s.homepage    = "https://github.com/intridea/grape"
   s.summary     = %q{A simple Ruby framework for building REST-like APIs.}
   s.description = %q{A Ruby framework for rapid API development with great conventions.}
+  s.license     = "MIT"
 
   s.rubyforge_project = "grape"
 
@@ -24,7 +25,7 @@ Gem::Specification.new do |s|
   s.add_development_dependency 'maruku'
   s.add_development_dependency 'yard'
   s.add_development_dependency 'rack-test'
-  s.add_development_dependency 'rspec', '~> 2.7.0'
+  s.add_development_dependency 'rspec', '~> 2.8'
   s.add_development_dependency 'bundler'
 
   s.files         = `git ls-files`.split("\n")

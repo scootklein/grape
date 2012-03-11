@@ -1,5 +1,5 @@
 require 'spec_helper'
-require 'shared_versioning_examples'
+require 'shared/versioning_examples'
 
 describe Grape::API do
   subject { Class.new(Grape::API) }
@@ -58,7 +58,7 @@ describe Grape::API do
     end
 
     it 'should route if any media type is allowed' do
-
+      
     end
   end
 
@@ -83,11 +83,14 @@ describe Grape::API do
 
     it 'should come after the prefix and version' do
       subject.prefix :rad
-      subject.version :v1, :using => :path
+      subject.version 'v1', :using => :path
 
       subject.namespace :awesome do
-        prepare_path('hello').should == '/rad/:version/awesome/hello(.:format)'
+        get('/hello'){ "worked" }
       end
+
+      get "/rad/v1/awesome/hello"
+      last_response.body.should == "worked"
     end
 
     it 'should cancel itself after the block is over' do
@@ -120,15 +123,20 @@ describe Grape::API do
       get '/members/23'
       last_response.body.should == "23"
     end
-
+    
     it 'should be callable with nil just to push onto the stack' do
       subject.namespace do
         version 'v2', :using => :path
-        prepare_path('hello').should == '/:version/hello(.:format)'
+        get('/hello'){ "inner" }
       end
-      subject.send(:prepare_path, 'hello').should == '/hello(.:format)'
-    end
+      subject.get('/hello'){ "outer" }
 
+      get '/v2/hello'
+      last_response.body.should == "inner"
+      get '/hello'
+      last_response.body.should == "outer"
+    end
+    
     %w(group resource resources segment).each do |als|
       it "`.#{als}` should be an alias" do
         subject.send(als, :awesome) do
@@ -167,33 +175,44 @@ describe Grape::API do
       last_response.body.should eql 'foo'
     end
 
-    it 'should allow for format' do
-      subject.get("/abc") do
-        "json"
+    context "format" do
+      before(:each) do
+        subject.get("/abc") do
+          RSpec::Mocks::Mock.new(:to_json => 'abc', :to_txt => 'def')
+        end
+      end
+    
+      it "should allow .json" do
+        get '/abc.json'
+        last_response.status.should == 200
+        last_response.body.should eql 'abc' # json-encoded symbol
       end
 
-      get '/abc.json'
-      last_response.body.should eql '"json"'
+      it "should allow .txt" do
+        get '/abc.txt'
+        last_response.status.should == 200
+        last_response.body.should eql 'def' # raw text
+      end
     end
 
     it 'should allow for format without corrupting a param' do
       subject.get('/:id') do
-        params[:id]
+        {"id" => params[:id]}
       end
 
       get '/awesome.json'
-      last_response.body.should eql "\"awesome\""
+      last_response.body.should eql '{"id":"awesome"}'
     end
 
     it 'should allow for format in namespace with no path' do
       subject.namespace :abc do
         get do
-          "json"
+          ["json"]
         end
       end
 
       get '/abc.json'
-      last_response.body.should eql '"json"'
+      last_response.body.should eql '["json"]'
     end
 
     it 'should allow for multiple verbs' do
@@ -212,7 +231,7 @@ describe Grape::API do
       subject.route([:get, :post], '/:id/first') do
         "first"
       end
-
+      
       subject.route([:get, :post], '/:id') do
         "ola"
       end
@@ -238,13 +257,13 @@ describe Grape::API do
         "lol"
       end
 
-      %w(get post put delete options).each do |m|
+      %w(get post put delete options patch).each do |m|
         send(m, '/abc')
         last_response.body.should eql 'lol'
       end
     end
 
-    verbs = %w(post get head delete put options)
+    verbs = %w(post get head delete put options patch)
     verbs.each do |verb|
       it "should allow and properly constrain a #{verb.upcase} method" do
         subject.send(verb, '/example') do
@@ -323,17 +342,19 @@ describe Grape::API do
       last_response.headers['Content-Type'].should eql 'application/json'
     end
   end
-
+  
   context 'custom middleware' do
     class PhonyMiddleware
       def initialize(app, *args)
         @args = args
         @app = app
+        @block = true if block_given?
       end
 
       def call(env)
         env['phony.args'] ||= []
         env['phony.args'] << @args
+        env['phony.block'] = true if @block
         @app.call(env)
       end
     end
@@ -353,7 +374,7 @@ describe Grape::API do
           {:middleware => [[PhonyMiddleware, 'foo']]}
         ]
         subject.stub!(:settings).and_return(settings)
-
+  
         subject.middleware.should eql [
           [PhonyMiddleware, 123],
           [PhonyMiddleware, 'abc'],
@@ -387,6 +408,36 @@ describe Grape::API do
         get '/'
         last_response.body.should eql 'hello'
       end
+
+      it 'should add a block if one is given' do
+        block = lambda{ }
+        subject.use PhonyMiddleware, &block
+        subject.middleware.should eql [[PhonyMiddleware, block]]
+      end
+
+      it 'should use a block if one is given' do
+        block = lambda{ }
+        subject.use PhonyMiddleware, &block
+        subject.get '/' do
+          env['phony.block'].inspect
+        end
+
+        get '/'
+        last_response.body.should == 'true'
+      end
+
+      it 'should not destroy the middleware settings on multiple runs' do
+        block = lambda{ }
+        subject.use PhonyMiddleware, &block
+        subject.get '/' do
+          env['phony.block'].inspect
+        end
+
+        2.times do 
+          get '/'
+          last_response.body.should == 'true'
+        end
+      end
     end
   end
   describe '.basic' do
@@ -397,7 +448,7 @@ describe Grape::API do
       subject.get(:hello){ "Hello, world."}
       get '/hello'
       last_response.status.should eql 401
-      get '/hello', {}, 'HTTP_AUTHORIZATION' => encode_basic('allow','whatever')
+      get '/hello', {}, 'HTTP_AUTHORIZATION' => encode_basic_auth('allow','whatever')
       last_response.status.should eql 200
     end
 
@@ -425,7 +476,7 @@ describe Grape::API do
       subject.get(:hello){ "Hello, world."}
       get '/hello'
       last_response.status.should eql 401
-      get '/hello', {}, 'HTTP_AUTHORIZATION' => encode_basic('allow','whatever')
+      get '/hello', {}, 'HTTP_AUTHORIZATION' => encode_basic_auth('allow','whatever')
       last_response.status.should eql 200
     end
   end
@@ -528,7 +579,7 @@ describe Grape::API do
       subject.get '/def' do
         'def'
       end
-
+      
       get '/new/abc'
       last_response.status.should eql 404
       get '/legacy/abc'
@@ -628,6 +679,17 @@ describe Grape::API do
     end
   end
 
+  describe ".content_type" do
+    it "sets additional content-type" do
+      subject.content_type :xls, "application/vnd.ms-excel"
+      subject.get(:hello) do
+        "some binary content"
+      end
+      get '/hello.xls'
+      last_response.content_type.should == "application/vnd.ms-excel"
+    end
+  end
+
   describe ".default_error_status" do
     it 'should allow setting default_error_status' do
       subject.rescue_from :all
@@ -657,15 +719,15 @@ describe Grape::API do
     describe "single method api structure" do
       before(:each) do
         subject.get :ping do
-          'pong'
+           'pong'
         end
       end
       it "returns one route" do
-        subject.routes.size.should == 1
-        route = subject.routes[0]
-        route.route_version.should be_nil
-        route.route_path.should == "/ping(.:format)"
-        route.route_method.should == "GET"
+         subject.routes.size.should == 1
+         route = subject.routes[0]
+         route.route_version.should be_nil
+         route.route_path.should == "/ping(.:format)"
+         route.route_method.should == "GET"
       end
     end
     describe "api structure with two versions and a namespace" do
@@ -673,7 +735,7 @@ describe Grape::API do
         # version v1
         version 'v1', :using => :path
         get "version" do
-          api.version
+           api.version
         end
         # version v2
         version 'v2', :using => :path
@@ -681,33 +743,33 @@ describe Grape::API do
         namespace "n1" do
           namespace "n2" do
             get "version" do
-              api.version
+               api.version
             end
           end
         end
       end
       it "should return versions" do
-        TwitterAPI::versions.should == [ 'v1', 'v2' ]
+         TwitterAPI::versions.should == [ 'v1', 'v2' ]
       end
       it "should set route paths" do
-        TwitterAPI::routes.size.should >= 2
-        TwitterAPI::routes[0].route_path.should == "/:version/version(.:format)"
-        TwitterAPI::routes[1].route_path.should == "/p/:version/n1/n2/version(.:format)"
+         TwitterAPI::routes.size.should >= 2
+         TwitterAPI::routes[0].route_path.should == "/:version/version(.:format)"
+         TwitterAPI::routes[1].route_path.should == "/p/:version/n1/n2/version(.:format)"
       end
       it "should set route versions" do
-        TwitterAPI::routes[0].route_version.should == 'v1'
-        TwitterAPI::routes[1].route_version.should == 'v2'
+         TwitterAPI::routes[0].route_version.should == 'v1'
+         TwitterAPI::routes[1].route_version.should == 'v2'
       end
       it "should set a nested namespace" do
-        TwitterAPI::routes[1].route_namespace.should == "/n1/n2"
+         TwitterAPI::routes[1].route_namespace.should == "/n1/n2"
       end
       it "should set prefix" do
-        TwitterAPI::routes[1].route_prefix.should == 'p'
+         TwitterAPI::routes[1].route_prefix.should == 'p'
       end
     end
     describe "api structure with additional parameters" do
       before(:each) do
-        subject.get 'split/:string', { :params => [ "token" ], :optional_params => [ "limit" ] } do
+        subject.get 'split/:string', { :params => { "token" => "a token" }, :optional_params => { "limit" => "the limit" } } do 
           params[:string].split(params[:token], (params[:limit] || 0).to_i)
         end
       end
@@ -721,12 +783,89 @@ describe Grape::API do
       end
       it "should set route_params" do
         subject.routes.size.should == 1
-        subject.routes[0].route_params.should == [ "string", "token" ]
-        subject.routes[0].route_optional_params.should == [ "limit" ]
+        subject.routes[0].route_params.should == { "string" => "", "token" => "a token" }
+        subject.routes[0].route_optional_params.should == { "limit" => "the limit" }
       end
     end
   end
 
+  context "desc" do
+    describe "empty api structure" do
+      it "returns an empty array of routes" do
+        subject.desc "grape api"
+        subject.routes.should == []
+      end
+    end     
+    describe "single method with a desc" do
+      before(:each) do
+        subject.desc "ping method"
+        subject.get :ping do 
+          'pong'
+        end
+      end
+      it "returns route description" do
+        subject.routes[0].route_description.should == "ping method"
+      end
+    end    
+    describe "single method with a an array of params and a desc hash block" do
+      before(:each) do
+        subject.desc "ping method", { :params => { "x" => "y" } }
+        subject.get "ping/:x" do 
+          'pong'
+        end
+      end
+      it "returns route description" do
+        subject.routes[0].route_description.should == "ping method"
+      end
+    end    
+    describe "api structure with multiple methods and descriptions" do
+      before(:each) do
+        class JitterAPI < Grape::API
+          desc "first method"
+          get "first" do; end
+          get "second" do; end
+          desc "third method"
+          get "third" do; end
+        end
+      end
+      it "should return a description for the first method" do
+        JitterAPI::routes[0].route_description.should == "first method"
+        JitterAPI::routes[1].route_description.should be_nil
+        JitterAPI::routes[2].route_description.should == "third method"
+      end
+    end
+    describe "api structure with multiple methods, namespaces, descriptions and options" do
+      before(:each) do
+        class LitterAPI < Grape::API
+          desc "first method"
+          get "first" do; end
+          get "second" do; end
+          namespace "ns" do
+            desc "ns second", :foo => "bar"
+            get "second" do; end
+          end
+          desc "third method", :details => "details of third method"
+          get "third" do; end
+          desc "Reverses a string.", { :params =>
+            { "s" => { :desc => "string to reverse", :type => "string" }}
+          }
+          get "reverse" do
+            params[:s].reverse
+          end
+        end
+      end
+      it "should return a description for the first method" do
+        LitterAPI::routes[0].route_description.should == "first method"
+        LitterAPI::routes[1].route_description.should be_nil
+        LitterAPI::routes[2].route_description.should == "ns second"
+        LitterAPI::routes[2].route_foo.should == "bar"
+        LitterAPI::routes[3].route_description.should == "third method"
+        LitterAPI::routes[4].route_description.should == "Reverses a string."
+        LitterAPI::routes[4].route_params.should == { "s" => { :desc => "string to reverse", :type => "string" }}
+      end
+    end
+  end
+  
   describe ".rescue_from klass, block" do
     it 'should rescue Exception' do
       subject.rescue_from RuntimeError do |e|
@@ -797,14 +936,14 @@ describe Grape::API do
     end
   end
 
-  describe '.mount.' do
+  describe '.mount' do
     let(:mounted_app){ lambda{|env| [200, {}, ["MOUNTED"]]} }
-
+  
     context 'with a bare rack app' do
       before do
         subject.mount mounted_app => '/mounty'
       end
-
+    
       it 'should make a bare Rack app available at the endpoint' do
         get '/mounty'
         last_response.body.should == 'MOUNTED'
@@ -816,7 +955,7 @@ describe Grape::API do
       end
 
       it 'should be able to cascade' do
-        subject.mount lambda{ |env|
+        subject.mount lambda{ |env| 
           headers = {}
           headers['X-Cascade'] == 'pass' unless env['PATH_INFO'].include?('boo')
           [200, headers, ["Farfegnugen"]]
@@ -834,6 +973,86 @@ describe Grape::API do
         subject.mount mounted_app
         get '/'
         last_response.body.should == 'MOUNTED'
+      end
+    end
+
+    context 'mounting an API' do
+      it 'should apply the settings of the mounting api' do
+        subject.version 'v1', :using => :path
+
+        subject.namespace :cool do
+          app = Class.new(Grape::API)
+          app.get('/awesome') do
+            "yo"
+          end
+
+          mount app
+        end
+        get '/v1/cool/awesome'
+        last_response.body.should == 'yo'
+      end
+    end
+  end
+
+  describe '.endpoints' do
+    it 'should add one for each route created' do
+      subject.get '/'
+      subject.post '/'
+      subject.endpoints.size.should == 2
+    end
+  end
+
+  describe '.compile' do
+    it 'should set the instance' do
+      subject.instance.should be_nil
+      subject.compile
+      subject.instance.should be_kind_of(subject)
+    end
+  end
+
+  describe '.change!' do
+    it 'should invalidate any compiled instance' do
+      subject.compile
+      subject.change!
+      subject.instance.should be_nil
+    end
+  end
+  
+  describe ".route" do
+    context "plain" do
+      before(:each) do
+        subject.get '/' do
+          route.route_path
+        end
+        subject.get '/path' do
+          route.route_path
+        end
+      end
+      it 'should provide access to route info' do
+        get '/'
+        last_response.body.should == "/(.:format)"
+        get '/path'
+        last_response.body.should == "/path(.:format)"
+      end
+    end
+    context "with desc" do    
+      before(:each) do
+        subject.desc 'returns description'
+        subject.get '/description' do
+          route.route_description
+        end
+        subject.desc 'returns parameters', { :params => { "x" => "y" }}
+        subject.get '/params/:id' do
+          route.route_params[params[:id]]
+        end
+      end
+      it 'should return route description' do
+        get '/description'
+        last_response.body.should == "returns description"
+      end
+      it 'should return route parameters' do
+        get '/params/x'
+        last_response.body.should == "y"
       end
     end
   end
