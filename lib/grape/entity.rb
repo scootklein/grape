@@ -3,7 +3,8 @@ require 'hashie'
 module Grape
   # An Entity is a lightweight structure that allows you to easily
   # represent data from your application in a consistent and abstracted
-  # way in your API.
+  # way in your API. Entities can also provide documentation for the
+  # fields exposed.
   #
   # @example Entity Definition
   #
@@ -11,6 +12,7 @@ module Grape
   #     module Entities
   #       class User < Grape::Entity
   #         expose :first_name, :last_name, :screen_name, :location
+  #         expose :field, :documentation => {:type => "string", :desc => "describe the field"}
   #         expose :latest_status, :using => API::Status, :as => :status, :unless => {:collection => true}
   #         expose :email, :if => {:type => :full}
   #         expose :new_attribute, :if => {:version => 'v2'}
@@ -30,6 +32,7 @@ module Grape
   #     class Users < Grape::API
   #       version 'v2'
   #
+  #       desc 'User index', { :object_fields => API::Entities::User.documentation }
   #       get '/users' do
   #         @users = User.all
   #         type = current_user.admin? ? :full : :default
@@ -39,6 +42,60 @@ module Grape
   #   end
   class Entity
     attr_reader :object, :options
+
+    # The Entity DSL allows you to mix entity functionality into
+    # your existing classes.
+    module DSL
+      def self.included(base)
+        base.extend ClassMethods
+        ancestor_entity_class = base.ancestors.detect{|a| a.entity_class if a.respond_to?(:entity_class)}
+        base.const_set(:Entity, Class.new(ancestor_entity_class || Grape::Entity)) unless const_defined?(:Entity)
+      end
+
+      module ClassMethods
+        # Returns the automatically-created entity class for this
+        # Class.
+        def entity_class(search_ancestors=true)
+          klass = const_get(:Entity) if const_defined?(:Entity)
+          klass ||= ancestors.detect{|a| a.entity_class(false) if a.respond_to?(:entity_class) } if search_ancestors
+          klass
+        end
+
+        # Call this to make exposures to the entity for this Class.
+        # Can be called with symbols for the attributes to expose,
+        # a block that yields the full Entity DSL (See Grape::Entity),
+        # or both.
+        #
+        # @example Symbols only.
+        #
+        #   class User
+        #     include Grape::Entity::DSL
+        #     
+        #     entity :name, :email
+        #   end
+        #
+        # @example Mixed.
+        #
+        #   class User
+        #     include Grape::Entity::DSL
+        #     
+        #     entity :name, :email do
+        #       expose :latest_status, using: Status::Entity, if: :include_status
+        #       expose :new_attribute, :if => {:version => 'v2'}
+        #     end
+        #   end
+        def entity(*exposures, &block)
+          entity_class.expose *exposures if exposures.any?
+          entity_class.class_eval(&block) if block_given?
+          entity_class
+        end
+      end
+
+      # Instantiates an entity version of this object.
+      def entity
+        self.class.entity_class.new(self)
+      end
+    end
 
     # This method is the primary means by which you will declare what attributes
     # should be exposed by the entity.
@@ -63,6 +120,8 @@ module Grape
     #   will be called with the represented object as well as the
     #   runtime options that were passed in. You can also just supply a
     #   block to the expose call to achieve the same effect.
+    # @option options :documentation Define documenation for an exposed
+    #   field, typically the value is a hash with two fields, type and desc.
     def self.expose(*args, &block)
       options = args.last.is_a?(Hash) ? args.pop : {}
 
@@ -71,6 +130,8 @@ module Grape
         raise ArgumentError, "You may not use block-setting on multi-attribute exposures." if block_given?
       end
 
+      raise ArgumentError, "You may not use block-setting when also using format_with" if block_given? && options[:format_with].respond_to?(:call)
+
       options[:proc] = block if block_given?
 
       args.each do |attribute|
@@ -78,11 +139,79 @@ module Grape
       end
     end
 
-    # Returns a hash of exposures that have been declared for this Entity. The keys
+    # Returns a hash of exposures that have been declared for this Entity or ancestors. The keys
     # are symbolized references to methods on the containing object, the values are
     # the options that were passed into expose.
     def self.exposures
-      (@exposures ||= {})
+      @exposures ||= {}
+
+      if superclass.respond_to? :exposures
+        @exposures = superclass.exposures.merge(@exposures)
+      end
+
+      @exposures
+    end
+
+    # Returns a hash, the keys are symbolized references to fields in the entity,
+    # the values are document keys in the entity's documentation key. When calling
+    # #docmentation, any exposure without a documentation key will be ignored.
+    def self.documentation
+      @documentation ||= exposures.inject({}) do |memo, value|
+                           unless value[1][:documentation].nil? || value[1][:documentation].empty?
+                             memo[value[0]] = value[1][:documentation]
+                           end
+                           memo
+                         end
+
+      if superclass.respond_to? :documentation
+        @documentation = superclass.documentation.merge(@documentation)
+      end
+
+      @documentation
+    end
+
+    # This allows you to declare a Proc in which exposures can be formatted with.
+    # It take a block with an arity of 1 which is passed as the value of the exposed attribute.
+    #
+    # @param name [Symbol] the name of the formatter
+    # @param block [Proc] the block that will interpret the exposed attribute
+    #
+    #
+    #
+    # @example Formatter declaration
+    #
+    #   module API
+    #     module Entities
+    #       class User < Grape::Entity
+    #         format_with :timestamp do |date|
+    #           date.strftime('%m/%d/%Y')
+    #         end
+    #
+    #         expose :birthday, :last_signed_in, :format_with => :timestamp
+    #       end
+    #     end
+    #   end
+    #
+    # @example Formatters are available to all decendants
+    #
+    #   Grape::Entity.format_with :timestamp do |date|
+    #     date.strftime('%m/%d/%Y')
+    #   end
+    #
+    def self.format_with(name, &block)
+      raise ArgumentError, "You must pass a block for formatters" unless block_given?
+      formatters[name.to_sym] = block
+    end
+
+    # Returns a hash of all formatters that are registered for this and it's ancestors.
+    def self.formatters
+      @formatters ||= {}
+
+      if superclass.respond_to? :formatters
+        @formatters = superclass.formatters.merge(@formatters)
+      end
+
+      @formatters
     end
 
     # This allows you to set a root element name for your representation.
@@ -165,6 +294,14 @@ module Grape
       self.class.exposures
     end
 
+    def documentation
+      self.class.documentation
+    end
+
+    def formatters
+      self.class.formatters
+    end
+
     # The serializable hash is the Entity's primary output. It is the transformed
     # hash for the given data model and is used as the basis for serialization to
     # JSON and other formats.
@@ -176,7 +313,17 @@ module Grape
       return nil if object.nil?
       opts = options.merge(runtime_options || {})
       exposures.inject({}) do |output, (attribute, exposure_options)|
-        output[key_for(attribute)] = value_for(attribute, opts) if conditions_met?(exposure_options, opts)
+        if (exposure_options.has_key?(:proc) || object.respond_to?(attribute)) && conditions_met?(exposure_options, opts)
+          partial_output = value_for(attribute, opts)
+          output[key_for(attribute)] =
+            if partial_output.respond_to? :serializable_hash
+              partial_output.serializable_hash(runtime_options)
+            elsif partial_output.kind_of?(Array) && !partial_output.map {|o| o.respond_to? :serializable_hash}.include?(false)
+              partial_output.map {|o| o.serializable_hash}
+            else
+              partial_output
+            end
+        end
         output
       end
     end
@@ -195,7 +342,20 @@ module Grape
       if exposure_options[:proc]
         exposure_options[:proc].call(object, options)
       elsif exposure_options[:using]
-        exposure_options[:using].represent(object.send(attribute), :root => nil)
+        using_options = options.dup
+        using_options.delete(:collection)
+        using_options[:root] = nil
+        exposure_options[:using].represent(object.send(attribute), using_options)
+      elsif exposure_options[:format_with]
+        format_with = exposure_options[:format_with]
+
+        if format_with.is_a?(Symbol) && formatters[format_with]
+          formatters[format_with].call(object.send(attribute))
+        elsif format_with.is_a?(Symbol)
+          self.send(format_with, object.send(attribute))
+        elsif format_with.respond_to? :call
+          format_with.call(object.send(attribute))
+        end
       else
         object.send(attribute)
       end

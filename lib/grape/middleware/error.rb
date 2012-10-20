@@ -24,11 +24,11 @@ module Grape
         if (options[:rescue_options] || {})[:backtrace] && backtrace && ! backtrace.empty?
           result = result.merge({ :backtrace => backtrace })
         end
-        MultiJson.encode(result)
+        MultiJson.dump(result)
       end
       
       def encode_txt(message, backtrace)
-        result = message.is_a?(Hash) ? MultiJson.encode(message) : message
+        result = message.is_a?(Hash) ? MultiJson.dump(message) : message
         if (options[:rescue_options] || {})[:backtrace] && backtrace && ! backtrace.empty?
           result += "\r\n "
           result += backtrace.join("\r\n ")
@@ -44,11 +44,19 @@ module Grape
             return @app.call(@env) 
           })
         rescue Exception => e
-          raise unless options[:rescue_all] || (options[:rescued_errors] || []).include?(e.class)
-          handler = options[:rescue_handlers][e.class] || options[:rescue_handlers][:all]
+          is_rescuable = rescuable?(e.class)
+          if e.is_a?(Grape::Exceptions::Base) && !is_rescuable
+            handler = lambda {|e| error_response(e) }
+          else
+            raise unless is_rescuable
+            handler = options[:rescue_handlers][e.class] || options[:rescue_handlers][:all]
+          end
           handler.nil? ? handle_error(e) : self.instance_exec(e, &handler)
         end
-        
+      end
+
+      def rescuable?(klass)
+        options[:rescue_all] || (options[:rescued_errors] || []).include?(klass)
       end
       
       def handle_error(e)

@@ -1,10 +1,10 @@
 require 'spec_helper'
 
 describe Grape::Entity do
-  let(:fresh_class){ Class.new(Grape::Entity) }
+  let(:fresh_class) { Class.new(Grape::Entity) }
 
   context 'class methods' do
-    subject{ fresh_class }
+    subject { fresh_class }
 
     describe '.expose' do
       context 'multiple attributes' do
@@ -24,6 +24,10 @@ describe Grape::Entity do
           expect{ subject.expose :name, :email, :as => :foo }.to raise_error(ArgumentError)
           expect{ subject.expose :name, :as => :foo }.not_to raise_error
         end
+
+        it 'should make sure that :format_with as a proc can not be used with a block' do
+          expect { subject.expose :name, :format_with => Proc.new {} do |object,options| end }.to raise_error(ArgumentError)
+        end
       end
 
       context 'with a block' do
@@ -37,6 +41,66 @@ describe Grape::Entity do
           block = lambda{|obj,opts| true }
           subject.expose :name, &block
           subject.exposures[:name][:proc].should == block
+        end
+      end
+
+      context 'inherited exposures' do
+        it 'should return exposures from an ancestor' do
+          subject.expose :name, :email
+          child_class = Class.new(subject)
+
+          child_class.exposures.should eq(subject.exposures)
+        end
+
+        it 'should return exposures from multiple ancestor' do
+          subject.expose :name, :email
+          parent_class = Class.new(subject)
+          child_class  = Class.new(parent_class)
+
+          child_class.exposures.should eq(subject.exposures)
+        end
+
+        it 'should return descendant exposures as a priotity' do
+          subject.expose :name, :email
+          child_class = Class.new(subject)
+          child_class.expose :name do |n|
+            'foo'
+          end
+
+          subject.exposures[:name].should_not have_key :proc
+          child_class.exposures[:name].should have_key :proc
+        end
+      end
+
+      context 'register formatters' do
+        let(:date_formatter) { lambda {|date| date.strftime('%m/%d/%Y') }}
+
+        it 'should register a formatter' do
+          subject.format_with :timestamp, &date_formatter
+
+          subject.formatters[:timestamp].should_not be_nil
+        end
+
+        it 'should inherit formatters from ancestors' do
+          subject.format_with :timestamp, &date_formatter
+          child_class = Class.new(subject)
+
+          child_class.formatters.should == subject.formatters
+        end
+
+        it 'should not allow registering a formatter without a block' do
+          expect{ subject.format_with :foo }.to raise_error(ArgumentError)
+        end
+
+        it 'should format an exposure with a registered formatter' do
+          subject.format_with :timestamp do |date|
+            date.strftime('%m/%d/%Y')
+          end
+
+          subject.expose :birthday, :format_with => :timestamp
+
+          model  = { :birthday => Time.gm(2012, 2, 27) }
+          subject.new(mock(model)).as_json[:birthday].should == '02/27/2012'
         end
       end
     end
@@ -171,18 +235,24 @@ describe Grape::Entity do
   end
 
   context 'instance methods' do
+    
     let(:model){ mock(attributes) }
-    let(:attributes){ {
+    
+    let(:attributes) { {
       :name => 'Bob Bobson',
       :email => 'bob@example.com',
+      :birthday => Time.gm(2012, 2, 27),
+      :fantasies => ['Unicorns', 'Double Rainbows', 'Nessy'],
       :friends => [
-        mock(:name => "Friend 1", :email => 'friend1@example.com', :friends => []),
-        mock(:name => "Friend 2", :email => 'friend2@example.com', :friends => [])
+        mock(:name => "Friend 1", :email => 'friend1@example.com', :fantasies => [], :birthday => Time.gm(2012, 2, 27), :friends => []),
+        mock(:name => "Friend 2", :email => 'friend2@example.com', :fantasies => [], :birthday => Time.gm(2012, 2, 27), :friends => [])
       ]
     } }
+    
     subject{ fresh_class.new(model) }
 
     describe '#serializable_hash' do
+
       it 'should not throw an exception if a nil options object is passed' do
         expect{ fresh_class.new(model).serializable_hash(nil) }.not_to raise_error
       end
@@ -191,6 +261,88 @@ describe Grape::Entity do
         fresh_class.expose :name
         expect{ fresh_class.new(nil).serializable_hash }.not_to raise_error
       end
+
+      it 'should not throw an exception when an attribute is not found on the object' do
+        fresh_class.expose :name, :non_existant_attribute
+        expect{ fresh_class.new(model).serializable_hash }.not_to raise_error
+      end
+
+      it "should not expose attributes that don't exist on the object" do
+        fresh_class.expose :email, :non_existant_attribute, :name
+
+        res = fresh_class.new(model).serializable_hash
+        res.should have_key :email
+        res.should_not have_key :non_existant_attribute
+        res.should have_key :name
+      end
+
+      it "should not expose attributes that don't exist on the object, even with criteria" do
+        fresh_class.expose :email
+        fresh_class.expose :non_existant_attribute, :if => lambda { false }
+        fresh_class.expose :non_existant_attribute2, :if => lambda { true }
+
+        res = fresh_class.new(model).serializable_hash
+        res.should have_key :email
+        res.should_not have_key :non_existant_attribute
+        res.should_not have_key :non_existant_attribute2
+      end
+
+      it "should expose attributes that don't exist on the object only when they are generated by a block" do
+        fresh_class.expose :non_existant_attribute do |model, options|
+          "well, I do exist after all"
+        end
+        res = fresh_class.new(model).serializable_hash
+        res.should have_key :non_existant_attribute
+      end
+
+      it "should not expose attributes that are generated by a block but have not passed criteria" do
+        fresh_class.expose :non_existant_attribute, :proc => lambda {|model, options|
+          "I exist, but it is not yet my time to shine"
+        }, :if => lambda { |model, options| false }
+        res = fresh_class.new(model).serializable_hash
+        res.should_not have_key :non_existant_attribute
+      end
+      
+      context "#serializable_hash" do
+      
+        module EntitySpec
+          class EmbeddedExample
+            def serializable_hash(opts = {})
+              { :abc => 'def' }
+            end
+          end
+          class EmbeddedExampleWithMany
+            def name
+              "abc"
+            end
+            def embedded
+              [ EmbeddedExample.new, EmbeddedExample.new ]
+            end
+          end
+          class EmbeddedExampleWithOne
+            def name
+              "abc"
+            end
+            def embedded
+              EmbeddedExample.new
+            end
+          end
+        end
+      
+        it 'should serialize embedded objects which respond to #serializable_hash' do
+          fresh_class.expose :name, :embedded
+          presenter = fresh_class.new(EntitySpec::EmbeddedExampleWithOne.new)
+          presenter.serializable_hash.should == {:name => "abc", :embedded => {:abc => "def"}}
+        end
+
+        it 'should serialize embedded arrays of objects which respond to #serializable_hash' do
+          fresh_class.expose :name, :embedded
+          presenter = fresh_class.new(EntitySpec::EmbeddedExampleWithMany.new)
+          presenter.serializable_hash.should == {:name => "abc", :embedded => [{:abc => "def"}, {:abc => "def"}]}
+        end
+        
+      end
+      
     end
 
     describe '#value_for' do
@@ -201,6 +353,14 @@ describe Grape::Entity do
           expose :computed do |object, options|
             options[:awesome]
           end
+
+          expose :birthday, :format_with => :timestamp
+
+          def timestamp(date)
+            date.strftime('%m/%d/%Y')
+          end
+
+          expose :fantasies, :format_with => lambda {|f| f.reverse }
         end
       end
 
@@ -215,23 +375,102 @@ describe Grape::Entity do
         rep.last.serializable_hash[:name].should == 'Friend 2'
       end
 
-      it 'should disable root key name for child representations' do
-        class FriendEntity < Grape::Entity
-          root 'friends', 'friend'
-          expose :name, :email
+      context 'child representations' do
+        it 'should disable root key name for child representations' do
+        
+          module EntitySpec
+            class FriendEntity < Grape::Entity
+              root 'friends', 'friend'
+              expose :name, :email
+            end
+          end
+          
+          fresh_class.class_eval do
+            expose :friends, :using => EntitySpec::FriendEntity
+          end
+          
+          rep = subject.send(:value_for, :friends)
+          rep.should be_kind_of(Array)
+          rep.reject{|r| r.is_a?(EntitySpec::FriendEntity)}.should be_empty
+          rep.first.serializable_hash[:name].should == 'Friend 1'
+          rep.last.serializable_hash[:name].should == 'Friend 2'
         end
-        fresh_class.class_eval do
-          expose :friends, :using => FriendEntity
+
+        it 'should pass through custom options' do
+          module EntitySpec
+            class FriendEntity < Grape::Entity
+              root 'friends', 'friend'
+              expose :name
+              expose :email, :if => { :user_type => :admin }
+            end
+          end
+          
+          fresh_class.class_eval do
+            expose :friends, :using => EntitySpec::FriendEntity
+          end
+          
+          rep = subject.send(:value_for, :friends)
+          rep.should be_kind_of(Array)
+          rep.reject{|r| r.is_a?(EntitySpec::FriendEntity)}.should be_empty
+          rep.first.serializable_hash[:email].should be_nil
+          rep.last.serializable_hash[:email].should be_nil
+
+          rep = subject.send(:value_for, :friends, { :user_type => :admin })
+          rep.should be_kind_of(Array)
+          rep.reject{|r| r.is_a?(EntitySpec::FriendEntity)}.should be_empty
+          rep.first.serializable_hash[:email].should == 'friend1@example.com'
+          rep.last.serializable_hash[:email].should == 'friend2@example.com'
         end
-        rep = subject.send(:value_for, :friends)
-        rep.should be_kind_of(Array)
-        rep.reject{|r| r.is_a?(FriendEntity)}.should be_empty
-        rep.first.serializable_hash[:name].should == 'Friend 1'
-        rep.last.serializable_hash[:name].should == 'Friend 2'
+
+        it 'should ignore the :collection parameter in the source options' do
+          module EntitySpec
+            class FriendEntity < Grape::Entity
+              root 'friends', 'friend'
+              expose :name
+              expose :email, :if => { :collection => true }
+            end
+          end
+          
+          fresh_class.class_eval do
+            expose :friends, :using => EntitySpec::FriendEntity
+          end
+          
+          rep = subject.send(:value_for, :friends, { :collection => false })
+          rep.should be_kind_of(Array)
+          rep.reject{|r| r.is_a?(EntitySpec::FriendEntity)}.should be_empty
+          rep.first.serializable_hash[:email].should == 'friend1@example.com'
+          rep.last.serializable_hash[:email].should == 'friend2@example.com'
+        end
+
       end
 
       it 'should call through to the proc if there is one' do
         subject.send(:value_for, :computed, :awesome => 123).should == 123
+      end
+
+      it 'should return a formatted value if format_with is passed' do
+        subject.send(:value_for, :birthday).should == '02/27/2012'
+      end
+
+      it 'should return a formatted value if format_with is passed a lambda' do
+        subject.send(:value_for, :fantasies).should == ['Nessy', 'Double Rainbows', 'Unicorns']
+      end
+    end
+
+    describe '#documentation' do
+      it 'should return an empty hash is no documentation is provided' do
+        fresh_class.expose :name
+
+        subject.documentation.should == {}
+      end
+
+      it 'should return each defined documentation hash' do
+        doc = {:type => "foo", :desc => "bar"}
+        fresh_class.expose :name, :documentation => doc
+        fresh_class.expose :email, :documentation => doc
+        fresh_class.expose :birthday
+
+        subject.documentation.should == {:name  => doc, :email => doc}
       end
     end
 
@@ -286,6 +525,54 @@ describe Grape::Entity do
 
         subject.send(:conditions_met?, exposure_options, :true => false).should be_true
         subject.send(:conditions_met?, exposure_options, :true => true).should be_false
+      end
+    end
+
+    describe "::DSL" do
+      subject{ Class.new }
+
+      it 'should create an Entity class when called' do
+        subject.should_not be_const_defined(:Entity)
+        subject.send(:include, Grape::Entity::DSL)
+        subject.should be_const_defined(:Entity)
+      end
+
+      context 'pre-mixed' do
+        before{ subject.send(:include, Grape::Entity::DSL) }
+
+        it 'should be able to define entity traits through DSL' do
+          subject.entity do
+            expose :name
+          end
+
+          subject.entity_class.exposures.should_not be_empty
+        end
+
+        it 'should be able to expose straight from the class' do
+          subject.entity :name, :email
+          subject.entity_class.exposures.size.should == 2
+        end
+
+        it 'should be able to mix field and advanced exposures' do
+          subject.entity :name, :email do
+            expose :third
+          end
+          subject.entity_class.exposures.size.should == 3
+        end
+
+        context 'instance' do
+          let(:instance){ subject.new }
+
+          describe '#entity' do
+            it 'should be an instance of the entity class' do
+              instance.entity.should be_kind_of(subject.entity_class)
+            end
+
+            it 'should have an object of itself' do
+              instance.entity.object.should == instance
+            end
+          end
+        end
       end
     end
   end

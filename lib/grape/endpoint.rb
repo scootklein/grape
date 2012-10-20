@@ -52,7 +52,9 @@ module Grape
           anchor = options[:route_options][:anchor]
           anchor = anchor.nil? ? true : anchor
 
-          path = compile_path(prepared_path, anchor && !options[:app])
+          requirements = options[:route_options][:requirements] || {}
+
+          path = compile_path(prepared_path, anchor && !options[:app], requirements)
           regex = Rack::Mount::RegexpWithNamedGroups.new(path)
           path_params = {}
           # named parameters in the api path
@@ -83,17 +85,17 @@ module Grape
       parts << ':version' if settings[:version] && settings[:version_options][:using] == :path
       parts << namespace.to_s if namespace
       parts << path.to_s if path && '/' != path
-      parts.last << '(.:format)'
-      Rack::Mount::Utils.normalize_path(parts.join('/'))
+      Rack::Mount::Utils.normalize_path(parts.join('/') + '(.:format)')
     end
 
     def namespace
       Rack::Mount::Utils.normalize_path(settings.stack.map{|s| s[:namespace]}.join('/'))
     end
 
-    def compile_path(prepared_path, anchor = true)
+    def compile_path(prepared_path, anchor = true, requirements = {})
       endpoint_options = {}
       endpoint_options[:version] = /#{settings[:version].join('|')}/ if settings[:version]
+      endpoint_options.merge!(requirements)
       Rack::Mount::Strexp.compile(prepared_path, endpoint_options, %w( / . ? ), anchor)
     end
 
@@ -115,7 +117,48 @@ module Grape
     # The parameters passed into the request as
     # well as parsed from URL segments.
     def params
-      @params ||= Hashie::Mash.new.deep_merge(request.params).deep_merge(env['rack.routing_args'] || {})
+      @params ||= Hashie::Mash.new.
+        deep_merge(request.params).
+        deep_merge(env['rack.routing_args'] || {}).
+        deep_merge(self.body_params)
+    end
+
+    # A filtering method that will return a hash
+    # consisting only of keys that have been declared by a
+    # `params` statement.
+    #
+    # @param params [Hash] The initial hash to filter. Usually this will just be `params`
+    # @param options [Hash] Can pass `:include_missing` and `:stringify` options.
+    def declared(params, options = {})
+      options[:include_missing] = true unless options.key?(:include_missing)
+
+      unless settings[:declared_params]
+        raise ArgumentError, "Tried to filter for declared parameters but none exist."
+      end
+      
+      settings[:declared_params].inject({}){|h,k|
+        output_key = options[:stringify] ? k.to_s : k.to_sym
+        if params.key?(output_key) || options[:include_missing]
+          h[output_key] = params[k]
+        end
+        h
+      }
+    end
+
+    # Pull out request body params if the content type matches and we're on a POST or PUT
+    def body_params
+      if ['POST', 'PUT'].include?(request.request_method.to_s.upcase) && request.content_length.to_i > 0
+        return case env['CONTENT_TYPE']
+          when 'application/json'
+            MultiJson.decode(request.body.read)
+          when 'application/xml'
+            MultiXml.parse(request.body.read)
+          else
+            {}
+          end
+      end
+
+      {}
     end
 
     # The API version as specified in the URL.
@@ -128,6 +171,26 @@ module Grape
     # @param status [Integer] the HTTP Status Code. Defaults to 403.
     def error!(message, status=403)
       throw :error, :message => message, :status => status
+    end
+
+    # Redirect to a new url.
+    #
+    # @param url [String] The url to be redirect.
+    # @param options [Hash] The options used when redirect.
+    #                       :permanent, default true.
+    def redirect(url, options = {})
+      merged_options = {:permanent => false }.merge(options)
+      if merged_options[:permanent]
+        status 301
+      else
+        if env['HTTP_VERSION'] == 'HTTP/1.1' && request.request_method.to_s.upcase != "GET"
+          status 303
+        else
+          status 302
+        end
+      end
+      header "Location", url
+      body ""
     end
 
     # Set or retrieve the HTTP status code.
@@ -155,6 +218,11 @@ module Grape
       else
         @header
       end
+    end
+
+    # Set response content-type
+    def content_type(val)
+      header('Content-Type', val)
     end
 
     # Set or get a cookie
@@ -209,6 +277,8 @@ module Grape
         entity_class ||= (settings[:representations] || {})[potential]
       end
 
+      entity_class ||= object.class.const_get(:Entity) if object.class.const_defined?(:Entity)
+
       root = options.delete(:root)
 
       representation = if entity_class
@@ -222,7 +292,7 @@ module Grape
       representation = { root => representation } if root
       body representation
     end
-    
+
     # Returns route information for the current request.
     #
     # @example
@@ -244,24 +314,34 @@ module Grape
 
       self.extend helpers
       cookies.read(@request)
+
       run_filters befores
+
+      # Retieve validations from this namespace and all parent namespaces.
+      settings.gather(:validations).each do |validator|
+        validator.validate!(params)
+      end
+
+      run_filters after_validations
+
       response_text = instance_eval &self.block
       run_filters afters
       cookies.write(header)
-      
+
       [status, header, [body || response_text]]
     end
 
     def build_middleware
       b = Rack::Builder.new
 
+      b.use Rack::Head
       b.use Grape::Middleware::Error,
         :default_status => settings[:default_error_status] || 403,
         :rescue_all => settings[:rescue_all],
-        :rescued_errors => settings[:rescued_errors],
+        :rescued_errors => aggregate_setting(:rescued_errors),
         :format => settings[:error_format] || :txt,
         :rescue_options => settings[:rescue_options],
-        :rescue_handlers => settings[:rescue_handlers] || {}
+        :rescue_handlers => merged_setting(:rescue_handlers)
 
       b.use Rack::Auth::Basic, settings[:auth][:realm], &settings[:auth][:proc] if settings[:auth] && settings[:auth][:type] == :http_basic
       b.use Rack::Auth::Digest::MD5, settings[:auth][:realm], settings[:auth][:opaque], &settings[:auth][:proc] if settings[:auth] && settings[:auth][:type] == :http_digest
@@ -275,7 +355,8 @@ module Grape
       end
 
       b.use Grape::Middleware::Formatter,
-        :default_format => settings[:default_format] || :json,
+        :format => settings[:format],
+        :default_format => settings[:default_format] || :txt,
         :content_types => settings[:content_types]
 
       aggregate_setting(:middleware).each do |m|
@@ -303,6 +384,12 @@ module Grape
       end
     end
 
+    def merged_setting(key)
+      settings.stack.inject({}) do |merged, frame|
+        merged.merge(frame[key] || {})
+      end
+    end
+
     def run_filters(filters)
       (filters || []).each do |filter|
         instance_eval &filter
@@ -310,6 +397,7 @@ module Grape
     end
 
     def befores; aggregate_setting(:befores) end
+    def after_validations; aggregate_setting(:after_validations) end
     def afters; aggregate_setting(:afters) end
   end
 end

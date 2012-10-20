@@ -2,12 +2,15 @@ require 'rack/mount'
 require 'rack/auth/basic'
 require 'rack/auth/digest/md5'
 require 'logger'
+require 'grape/util/deep_merge'
 
 module Grape
   # The API class is the primary entry point for
   # creating Grape APIs.Users should subclass this
   # class in order to build an API.
   class API
+    extend Validations::ClassMethods
+
     class << self
       attr_reader :route_set
       attr_reader :versions
@@ -32,6 +35,7 @@ module Grape
         @endpoints = []
         @mountings = []
         @routes = nil
+        reset_validations!
       end
 
       def compile
@@ -96,12 +100,17 @@ module Grape
           options = args.pop if args.last.is_a? Hash
           options ||= {}
           options = {:using => :path}.merge!(options)
+
+          raise ArgumentError, "Must specify :vendor option." if options[:using] == :header && !options.has_key?(:vendor)
+
           @versions = versions | args
           nest(block) do
             set(:version, args)
             set(:version_options, options)
           end
         end
+
+        @versions.last unless @versions.nil?
       end
 
       # Add a description to the next namespace or function.
@@ -109,11 +118,16 @@ module Grape
         @last_description = options.merge(:description => description)
       end
 
-      # Specify the default format for the API's
-      # serializers. Currently only `:json` is
-      # supported.
+      # Specify the default format for the API's serializers.
+      # May be `:json` or `:txt` (default).
       def default_format(new_format = nil)
         new_format ? set(:default_format, new_format.to_sym) : settings[:default_format]
+      end
+
+      # Specify the format for the API's serializers.
+      # May be `:json` or `:txt`.
+      def format(new_format = nil)
+        new_format ? set(:format, new_format.to_sym) : settings[:format]
       end
 
       # Specify the format for error messages.
@@ -203,9 +217,14 @@ module Grape
       #         end
       #       end
       #     end
-      def helpers(mod = nil, &block)
-        if block_given? || mod
-          mod ||= settings.peek[:helpers] || Module.new
+      def helpers(new_mod = nil, &block)
+        if block_given? || new_mod
+          mod = settings.peek[:helpers] || Module.new
+          if new_mod
+            mod.class_eval do
+              include new_mod
+            end
+          end
           mod.class_eval &block if block_given?
           set(:helpers, mod)
         else
@@ -274,14 +293,20 @@ module Grape
         endpoint_options = {
           :method => methods,
           :path => paths,
-          :route_options => (route_options || {}).merge(@last_description || {})
+          :route_options => (@namespace_description || {}).deep_merge(@last_description || {}).deep_merge(route_options || {})
         }
         endpoints << Grape::Endpoint.new(settings.clone, endpoint_options, &block)
+
         @last_description = nil
+        reset_validations!
       end
 
       def before(&block)
         imbue(:befores, [block])
+      end
+
+      def after_validation(&block)
+        imbue(:after_validations, [block])
       end
 
       def after(&block)
@@ -299,9 +324,13 @@ module Grape
 
       def namespace(space = nil, &block)
         if space || block_given?
+          previous_namespace_description = @namespace_description
+          @namespace_description = (@namespace_description || {}).deep_merge(@last_description || {})
+          @last_description = nil
           nest(block) do
             set(:namespace, space.to_s) if space
           end
+          @namespace_description = previous_namespace_description
         else
           Rack::Mount::Utils.normalize_path(settings.stack.map{|s| s[:namespace]}.join('/'))
         end
@@ -367,6 +396,7 @@ module Grape
           instance_eval &block if block_given?
           blocks.each{|b| instance_eval &b}
           settings.pop   # when finished, we pop the context
+          reset_validations!
         else
           instance_eval &block
         end
@@ -388,6 +418,7 @@ module Grape
       self.class.endpoints.each do |endpoint|
         endpoint.mount_in(@route_set)
       end
+      add_head_not_allowed_methods
       @route_set.freeze
     end
 
@@ -396,5 +427,41 @@ module Grape
     end
 
     reset!
+
+    private
+
+    # For every resource add a 'OPTIONS' route that returns an HTTP 204 response
+    # with a list of HTTP methods that can be called. Also add a route that
+    # will return an HTTP 405 response for any HTTP method that the resource
+    # cannot handle.
+    def add_head_not_allowed_methods
+      allowed_methods = Hash.new{|h,k| h[k] = [] }
+      resources       = self.class.endpoints.map do |endpoint|
+        endpoint.options[:app] && endpoint.options[:app].respond_to?(:endpoints) ?
+          endpoint.options[:app].endpoints.map(&:routes) :
+          endpoint.routes
+      end
+      resources.flatten.each do |route|
+        allowed_methods[route.route_compiled] << route.route_method
+      end
+
+      allowed_methods.each do |path_info, methods|
+        allow_header = (["OPTIONS"] | methods).join(", ")
+        unless methods.include?("OPTIONS")
+          @route_set.add_route( proc { [204, { 'Allow' => allow_header }, []]}, {
+            :path_info      => path_info,
+            :request_method => "OPTIONS"
+          })
+        end
+        not_allowed_methods = %w(GET PUT POST DELETE PATCH HEAD) - methods
+        not_allowed_methods.each do |bad_method|
+          @route_set.add_route( proc { [405, { 'Allow' => allow_header }, []]}, {
+            :path_info      => path_info,
+            :request_method => bad_method
+          })
+        end
+      end
+    end
+
   end
 end

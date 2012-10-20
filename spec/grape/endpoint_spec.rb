@@ -2,7 +2,6 @@ require 'spec_helper'
 
 describe Grape::Endpoint do
   subject { Class.new(Grape::API) }
-  before { subject.default_format :txt }
   def app; subject end
 
   describe '#initialize' do
@@ -108,7 +107,58 @@ describe Grape::Endpoint do
       ]
     end
   end
-  
+
+  describe '#declared' do
+    before do
+      subject.params do
+        requires :first
+        optional :second
+      end
+
+
+    end
+
+    it 'should have as many keys as there are declared params' do
+      subject.get "/declared" do
+        declared(params).keys.size.should == 2
+        ""
+      end
+
+      get '/declared?first=present'
+      last_response.status.should == 200
+    end
+
+    it 'should filter out any additional params that are given' do
+      subject.get "/declared" do
+        declared(params).key?(:other).should == false
+        ""
+      end
+
+      get '/declared?first=one&other=two'
+      last_response.status.should == 200
+    end
+
+    it 'should stringify if that option is passed' do
+      subject.get "/declared" do
+        declared(params, :stringify => true)["first"].should == "one"
+        ""
+      end
+
+      get '/declared?first=one&other=two'
+      last_response.status.should == 200
+    end
+
+    it 'should not include missing attributes if that option is passed' do
+      subject.get "/declared" do
+        declared(params, :include_missing => false)[:second].should == nil
+        ""
+      end
+
+      get '/declared?first=one&other=two'
+      last_response.status.should == 200
+    end
+  end
+
   describe '#params' do
     it 'should be available to the caller' do
       subject.get('/hey') do
@@ -134,6 +184,80 @@ describe Grape::Endpoint do
       end
       get '/location?location[city]=Dallas'
       last_response.body.should == 'Dallas'
+    end
+
+    context 'with special requirements' do
+      it 'should parse email param with provided requirements for params' do
+        subject.get('/:person_email', :requirements => { :person_email => /.*/ }) do
+        params[:person_email]
+        end
+
+        get '/rodzyn@grape.com'
+        last_response.body.should == 'rodzyn@grape.com'
+
+        get 'rodzyn@grape.com.pl'
+        last_response.body.should == 'rodzyn@grape.com.pl'
+      end
+
+      it 'should parse many params with provided regexps' do
+        subject.get('/:person_email/test/:number',
+          :requirements => {
+            :person_email => /rodzyn@(.*).com/,
+            :number => /[0-9]/ }) do
+        params[:person_email] << params[:number]
+        end
+
+        get '/rodzyn@grape.com/test/1'
+        last_response.body.should == 'rodzyn@grape.com1'
+
+        get '/rodzyn@testing.wrong/test/1'
+        last_response.status.should == 404
+
+        get 'rodzyn@test.com/test/wrong_number'
+        last_response.status.should == 404
+
+        get 'rodzyn@test.com/wrong_middle/1'
+        last_response.status.should == 404
+      end
+    end
+
+    context 'from body parameters' do
+      before(:each) do
+        subject.post '/request_body' do
+          params[:user]
+        end
+
+        subject.put '/request_body' do
+          params[:user]
+        end
+      end
+
+      it 'should convert JSON bodies to params' do
+        post '/request_body', MultiJson.encode(:user => 'Bobby T.'), {'CONTENT_TYPE' => 'application/json'}
+        last_response.body.should == 'Bobby T.'
+      end
+
+      it 'should not convert empty JSON bodies to params' do
+        put '/request_body', '', {'CONTENT_TYPE' => 'application/json'}
+        last_response.body.should == ''
+      end
+
+      it 'should convert XML bodies to params' do
+        post '/request_body', '<user>Bobby T.</user>', {'CONTENT_TYPE' => 'application/xml'}
+        last_response.body.should == 'Bobby T.'
+      end
+
+      it 'should convert XML bodies to params' do
+        put '/request_body', '<user>Bobby T.</user>', {'CONTENT_TYPE' => 'application/xml'}
+        last_response.body.should == 'Bobby T.'
+      end
+
+      it 'does not include parameters not defined by the body' do
+        subject.post '/omitted_params' do
+          body_params[:version].should == nil
+        end
+        post '/omitted_params', MultiJson.encode(:user => 'Blah'), {'CONTENT_TYPE' => 'application/json'}
+      end
     end
   end
 
@@ -167,6 +291,37 @@ describe Grape::Endpoint do
       get '/hey.json'
       last_response.status.should == 403
       last_response.body.should == '{"dude":"rad"}'
+    end
+  end
+  
+  describe "#redirect" do
+    it "should redirect to a url with status 302" do
+      subject.get('/hey') do
+        redirect "/ha"
+      end
+      get '/hey'
+      last_response.status.should eq 302
+      last_response.headers['Location'].should eq "/ha"
+      last_response.body.should eq ""
+    end
+
+    it "should have status code 303 if it is not get request and it is http 1.1" do
+      subject.post('/hey') do
+        redirect "/ha"
+      end
+      post '/hey', {}, 'HTTP_VERSION' => 'HTTP/1.1'
+      last_response.status.should eq 303
+      last_response.headers['Location'].should eq "/ha"
+    end
+
+    it "support permanent redirect" do
+      subject.get('/hey') do
+        redirect "/ha", :permanent => true
+      end
+      get '/hey'
+      last_response.status.should eq 301
+      last_response.headers['Location'].should eq "/ha"
+      last_response.body.should eq ""
     end
   end
 
@@ -243,6 +398,20 @@ describe Grape::Endpoint do
       last_response.body.should == 'Hiya'
     end
 
+    it 'should automatically use Klass::Entity if that exists' do
+      some_model = Class.new
+      entity = Class.new(Grape::Entity)
+      entity.stub!(:represent).and_return("Auto-detect!")
+
+      some_model.const_set :Entity, entity
+
+      subject.get '/example' do
+        present some_model.new
+      end
+      get '/example'
+      last_response.body.should == 'Auto-detect!'
+    end
+
     it 'should add a root key to the output if one is given' do
       subject.get '/example' do
         present({:abc => 'def'}, :root => :root)
@@ -305,8 +474,8 @@ describe Grape::Endpoint do
           verb
         end
         send(verb, '/example/and/some/more')
-        last_response.status.should eql (verb == "post" ? 201 : 200)
-        last_response.body.should eql verb
+        last_response.status.should eql verb == "post" ? 201 : 200
+        last_response.body.should eql verb == 'head' ? '' : verb
       end
     end
   end
